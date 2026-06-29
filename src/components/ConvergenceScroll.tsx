@@ -44,19 +44,19 @@ export default function ConvergenceScroll() {
   const [activeSectionIdx, setActiveSectionIdx]  = useState(0);
   const [sectionExiting,   setSectionExiting]    = useState(false);
 
-  // ── Preload ────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const images: HTMLImageElement[] = Array.from({ length: TOTAL_FRAMES });
-    let count = 0;
-    for (let i = 0; i < TOTAL_FRAMES; i++) {
-      const img  = new Image();
-      img.src    = `/frames/frame_${String(i + 1).padStart(2, "0")}.webp`;
-      const done = () => { count++; setLoadedCount(count); if (count === TOTAL_FRAMES) setAllLoaded(true); };
-      img.onload = done; img.onerror = done;
-      images[i]  = img;
-    }
-    imagesRef.current = images;
-  }, []);
+  // ── Preload (image-scroll implementation — commented out, replaced by VideoScroll) ──
+  // useEffect(() => {
+  //   const images: HTMLImageElement[] = Array.from({ length: TOTAL_FRAMES });
+  //   let count = 0;
+  //   for (let i = 0; i < TOTAL_FRAMES; i++) {
+  //     const img  = new Image();
+  //     img.src    = `/frames/frame_${String(i + 1).padStart(2, "0")}.webp`;
+  //     const done = () => { count++; setLoadedCount(count); if (count === TOTAL_FRAMES) setAllLoaded(true); };
+  //     img.onload = done; img.onerror = done;
+  //     images[i]  = img;
+  //   }
+  //   imagesRef.current = images;
+  // }, []);
 
   // ── Resize ─────────────────────────────────────────────────────────────────
   const resizeCanvas = useCallback(() => {

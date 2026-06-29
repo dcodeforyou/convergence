@@ -28,7 +28,7 @@ function NavItem({ label, href, active }: { label: string; href: string; active:
         display: "flex",
         alignItems: "center",
         gap: 5,
-        fontSize: 12,
+        fontSize: "clamp(9px, 2.2vw, 12px)",
         fontWeight: active ? 500 : 400,
         letterSpacing: "0.09em",
         textTransform: "uppercase",
@@ -81,7 +81,7 @@ export default function Navbar() {
   return (
     <nav
       className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between"
-      style={{ padding: "28px 40px" }}
+      style={{ padding: "clamp(16px, 4vw, 28px) clamp(16px, 5vw, 40px)" }}
     >
       {/* Brand */}
       <a
@@ -99,7 +99,7 @@ export default function Navbar() {
       </a>
 
       {/* Nav items */}
-      <ul className="flex items-center" style={{ gap: 36, listStyle: "none", margin: 0, padding: 0 }}>
+      <ul className="flex items-center" style={{ gap: "clamp(14px, 3.5vw, 36px)", listStyle: "none", margin: 0, padding: 0 }}>
         {NAV_ITEMS.map((item) => {
           const active = item.href !== "#" && (
             item.href === "/" ? pathname === "/" : pathname.startsWith(item.href)
