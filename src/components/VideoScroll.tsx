@@ -6,126 +6,148 @@ import SectionText from "./SectionText";
 
 const pixelFont = Press_Start_2P({ weight: "400", subsets: ["latin"], display: "swap" });
 
+// Number of frames pre-extracted from the video.
+// 60 frames over 500vh = ~8vh of scroll per frame, smooth on any device.
+const FRAME_COUNT = 60;
+
 function drawCover(
   ctx: CanvasRenderingContext2D,
-  video: HTMLVideoElement,
+  src: ImageBitmap,
   cw: number,
   ch: number,
 ) {
-  const vw    = video.videoWidth  || cw;
-  const vh    = video.videoHeight || ch;
-  const scale = Math.max(cw / vw, ch / vh);
-  const dw    = vw * scale;
-  const dh    = vh * scale;
-  ctx.drawImage(video, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+  const scale = Math.max(cw / src.width, ch / src.height);
+  const dw    = src.width  * scale;
+  const dh    = src.height * scale;
+  ctx.drawImage(src, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
 }
 
 export default function VideoScroll() {
-  const videoRef      = useRef<HTMLVideoElement>(null);
   const canvasRef     = useRef<HTMLCanvasElement>(null);
   const scrollHintRef = useRef<HTMLDivElement>(null);
+
+  // GPU-resident frames — drawImage from ImageBitmap is near zero cost
+  const framesRef  = useRef<ImageBitmap[]>([]);
+  const lastIdxRef = useRef(-1);
 
   const ticking    = useRef(false);
   const prevSecRef = useRef(0);
   const timerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [videoReady, setVideoReady] = useState(false);
-  const [sectionIdx, setSectionIdx] = useState(0);
-  const [isExiting,  setIsExiting]  = useState(false);
+  const [loadedCount, setLoadedCount] = useState(0);
+  const [framesReady, setFramesReady] = useState(false);
+  const [sectionIdx,  setSectionIdx]  = useState(0);
+  const [isExiting,   setIsExiting]   = useState(false);
 
-  // ── Canvas resize ────────────────────────────────────────────────────────────
+  // ── Canvas resize ─────────────────────────────────────────────────────────
   useEffect(() => {
     const resize = () => {
       const c = canvasRef.current;
       if (!c) return;
       c.width  = window.innerWidth;
       c.height = window.innerHeight;
+      lastIdxRef.current = -1; // force redraw after resize
     };
     resize();
     window.addEventListener("resize", resize);
     return () => window.removeEventListener("resize", resize);
   }, []);
 
-  // ── Frame rendering via requestVideoFrameCallback (rVFC) ────────────────────
-  // rVFC fires exactly when a newly decoded frame is ready — no stale draws,
-  // no blank frames between keyframes. Falls back to RAF for older browsers.
+  // ── Frame extraction ───────────────────────────────────────────────────────
+  // Seek forward through the video sequentially (fastest decode path for H.264),
+  // capture each position as an ImageBitmap (GPU-resident, instant drawImage).
+  // After this, scrubbing never touches the video decoder again.
   useEffect(() => {
-    const video  = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) return;
+    let cancelled = false;
 
-    // alpha:false = no per-pixel alpha compositing → faster GPU blit
-    // desynchronized:true = canvas updates decouple from page frame budget → lower latency
+    const extract = async () => {
+      const video = document.createElement("video");
+      video.muted      = true;
+      video.playsInline = true;
+      video.preload    = "auto";
+      video.src        = "/scroll-video.mp4";
+
+      // Wait for metadata so duration is available
+      await new Promise<void>(res => {
+        if (video.readyState >= 1) { res(); return; }
+        video.addEventListener("loadedmetadata", () => res(), { once: true });
+      });
+
+      const duration = video.duration;
+      const bitmaps: ImageBitmap[] = [];
+
+      for (let i = 0; i < FRAME_COUNT; i++) {
+        if (cancelled) return;
+
+        // Always seek forward — fastest decode pattern for H.264
+        video.currentTime = (i / (FRAME_COUNT - 1)) * duration;
+
+        await new Promise<void>(res =>
+          video.addEventListener("seeked", () => res(), { once: true }),
+        );
+
+        // createImageBitmap copies the decoded frame into GPU memory
+        const bmp = await createImageBitmap(video);
+        bitmaps.push(bmp);
+
+        setLoadedCount(i + 1);
+
+        // Draw first frame to canvas immediately so there's no blank flash
+        if (i === 0) {
+          const c = canvasRef.current;
+          if (c) {
+            const ctx = c.getContext("2d", { alpha: false })!;
+            ctx.fillStyle = "#040408";
+            ctx.fillRect(0, 0, c.width, c.height);
+            drawCover(ctx, bmp, c.width, c.height);
+          }
+        }
+      }
+
+      if (cancelled) return;
+      framesRef.current = bitmaps;
+      video.src = ""; // release video resources
+      setFramesReady(true);
+    };
+
+    extract();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Scroll → frame index + section detection ──────────────────────────────
+  useEffect(() => {
+    if (!framesReady) return;
+
+    const canvas     = canvasRef.current;
+    const scrollHint = scrollHintRef.current;
+    if (!canvas) return;
+
+    // alpha:false = skip per-pixel alpha blend on composite
+    // desynchronized:true = draw as soon as ready, not locked to page vsync
     const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true })!;
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "medium";
-
-    let rVFCHandle: number | null = null;
-    let rafHandle:  number | null = null;
-    let active = true;
-
-    const draw = () => {
-      if (!active || video.readyState < 2) return;
-      const cw = canvas.width, ch = canvas.height;
-      ctx.fillStyle = "#040408";
-      ctx.fillRect(0, 0, cw, ch);
-      drawCover(ctx, video, cw, ch);
-    };
-
-    const hasRVFC = "requestVideoFrameCallback" in video;
-
-    if (hasRVFC) {
-      // rVFC path: draw only when the browser signals a new decoded frame
-      const onFrame = () => {
-        draw();
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        rVFCHandle = (video as any).requestVideoFrameCallback(onFrame);
-      };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      rVFCHandle = (video as any).requestVideoFrameCallback(onFrame);
-    } else {
-      // RAF fallback for browsers without rVFC (Safari < 15.4, Firefox < 132)
-      const loop = () => {
-        if (!active) return;
-        draw();
-        rafHandle = requestAnimationFrame(loop);
-      };
-      rafHandle = requestAnimationFrame(loop);
-    }
-
-    const onReady = () => setVideoReady(true);
-    video.addEventListener("canplaythrough", onReady);
-    if (video.readyState >= 4) onReady();
-
-    return () => {
-      active = false;
-      video.removeEventListener("canplaythrough", onReady);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if (rVFCHandle !== null) (video as any).cancelVideoFrameCallback(rVFCHandle);
-      if (rafHandle  !== null) cancelAnimationFrame(rafHandle);
-    };
-  }, []);
-
-  // ── Scroll → currentTime + section detection ─────────────────────────────────
-  useEffect(() => {
-    const video      = videoRef.current;
-    const scrollHint = scrollHintRef.current;
 
     const update = () => {
       const scrollH = document.body.scrollHeight - window.innerHeight;
       const f = scrollH > 0 ? Math.min(Math.max(window.scrollY / scrollH, 0), 1) : 0;
 
-      // Direct seek — no lerp
-      if (video && video.duration) {
-        video.currentTime = f * video.duration;
+      // Direct index — no decode, no latency
+      const idx = Math.min(Math.round(f * (FRAME_COUNT - 1)), FRAME_COUNT - 1);
+      const bmp = framesRef.current[idx];
+
+      if (bmp && idx !== lastIdxRef.current) {
+        lastIdxRef.current = idx;
+        const cw = canvas.width, ch = canvas.height;
+        ctx.fillStyle = "#040408";
+        ctx.fillRect(0, 0, cw, ch);
+        drawCover(ctx, bmp, cw, ch);
       }
 
-      // Scroll hint fade via direct DOM write — no React re-render
       if (scrollHint) {
         scrollHint.style.opacity = f < 0.05 ? String(1 - f / 0.05) : "0";
       }
 
-      // Section: three equal thirds
       const next = f < 0.334 ? 0 : f < 0.667 ? 1 : 2;
       if (next !== prevSecRef.current) {
         prevSecRef.current = next;
@@ -140,7 +162,6 @@ export default function VideoScroll() {
       ticking.current = false;
     };
 
-    // RAF debounce — one update per frame, no matter how many scroll events fire
     const onScroll = () => {
       if (ticking.current) return;
       ticking.current = true;
@@ -152,25 +173,14 @@ export default function VideoScroll() {
       window.removeEventListener("scroll", onScroll);
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, []);
+  }, [framesReady]);
 
   return (
     <>
-      {/* Scroll space: 500vh */}
+      {/* Scroll space */}
       <div style={{ height: "500vh" }} />
 
-      {/* Hidden video — decode engine only, never painted directly */}
-      <video
-        ref={videoRef}
-        muted
-        playsInline
-        preload="auto"
-        style={{ display: "none" }}
-      >
-        <source src="/scroll-video.mp4" type="video/mp4" />
-      </video>
-
-      {/* Canvas — receives decoded frames via rVFC, GPU-composited */}
+      {/* Canvas — only output surface, no video element visible */}
       <canvas
         ref={canvasRef}
         style={{
@@ -179,8 +189,8 @@ export default function VideoScroll() {
           width: "100vw", height: "100vh",
           zIndex: 0,
           backgroundColor: "#040408",
-          opacity: videoReady ? 1 : 0,
-          transition: "opacity 0.7s ease",
+          opacity: framesReady ? 1 : 0,
+          transition: "opacity 0.6s ease",
         }}
       />
 
@@ -199,7 +209,7 @@ export default function VideoScroll() {
       />
 
       {/* Section text */}
-      {videoReady && (
+      {framesReady && (
         <div
           style={{
             position: "fixed",
@@ -240,7 +250,7 @@ export default function VideoScroll() {
       )}
 
       {/* Section progress dots */}
-      {videoReady && (
+      {framesReady && (
         <div
           style={{
             position: "fixed",
@@ -304,8 +314,8 @@ export default function VideoScroll() {
         </div>
       )}
 
-      {/* Scroll hint — only on section 0, opacity via DOM ref */}
-      {videoReady && sectionIdx === 0 && (
+      {/* Scroll hint — section 0 only, opacity via DOM ref */}
+      {framesReady && sectionIdx === 0 && (
         <div
           ref={scrollHintRef}
           style={{
@@ -345,10 +355,8 @@ export default function VideoScroll() {
             <div
               style={{
                 position: "absolute",
-                left: "50%",
-                top: 0,
-                width: 3,
-                height: 3,
+                left: "50%", top: 0,
+                width: 3, height: 3,
                 borderRadius: "50%",
                 backgroundColor: "#C8FF00",
                 boxShadow: "0 0 6px #C8FF00, 0 0 12px rgba(200,255,0,0.5)",
@@ -360,8 +368,8 @@ export default function VideoScroll() {
         </div>
       )}
 
-      {/* Loading screen */}
-      {!videoReady && (
+      {/* Loading screen with real frame extraction progress */}
+      {!framesReady && (
         <div
           style={{
             position: "fixed",
@@ -397,14 +405,20 @@ export default function VideoScroll() {
               <div
                 style={{
                   position: "absolute",
-                  top: 0,
+                  left: 0, top: 0,
                   height: "100%",
-                  width: "60%",
+                  width: `${(loadedCount / FRAME_COUNT) * 100}%`,
                   backgroundColor: "#C8FF00",
                   boxShadow: "0 0 10px #C8FF00, 0 0 20px rgba(200,255,0,0.4)",
-                  animation: "loadingBar 1.4s ease-in-out infinite",
+                  transition: "width 0.1s linear",
                 }}
               />
+            </div>
+            <div
+              className="tabular-nums text-xs font-mono"
+              style={{ color: "rgba(240,237,230,0.3)" }}
+            >
+              {String(loadedCount).padStart(2, "0")} / {FRAME_COUNT}
             </div>
           </div>
         </div>
