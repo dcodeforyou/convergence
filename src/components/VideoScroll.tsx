@@ -6,54 +6,126 @@ import SectionText from "./SectionText";
 
 const pixelFont = Press_Start_2P({ weight: "400", subsets: ["latin"], display: "swap" });
 
+function drawCover(
+  ctx: CanvasRenderingContext2D,
+  video: HTMLVideoElement,
+  cw: number,
+  ch: number,
+) {
+  const vw    = video.videoWidth  || cw;
+  const vh    = video.videoHeight || ch;
+  const scale = Math.max(cw / vw, ch / vh);
+  const dw    = vw * scale;
+  const dh    = vh * scale;
+  ctx.drawImage(video, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+}
+
 export default function VideoScroll() {
   const videoRef      = useRef<HTMLVideoElement>(null);
+  const canvasRef     = useRef<HTMLCanvasElement>(null);
   const scrollHintRef = useRef<HTMLDivElement>(null);
 
-  // RAF-debounce flag — guide §6 "only read scrollY once per frame"
-  const ticking       = useRef(false);
-  const rafRef        = useRef<number | null>(null);
-
-  // Section transition bookkeeping
-  const prevSecRef    = useRef(0);
-  const timerRef      = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ticking    = useRef(false);
+  const prevSecRef = useRef(0);
+  const timerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [videoReady, setVideoReady] = useState(false);
   const [sectionIdx, setSectionIdx] = useState(0);
   const [isExiting,  setIsExiting]  = useState(false);
 
-  // ── Wait for canplaythrough before revealing video (guide §6) ──────────────
+  // ── Canvas resize ────────────────────────────────────────────────────────────
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const onReady = () => setVideoReady(true);
-    video.addEventListener("canplaythrough", onReady);
-    // Already buffered (cache hit)
-    if (video.readyState >= 4) onReady();
-    return () => video.removeEventListener("canplaythrough", onReady);
+    const resize = () => {
+      const c = canvasRef.current;
+      if (!c) return;
+      c.width  = window.innerWidth;
+      c.height = window.innerHeight;
+    };
+    resize();
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
   }, []);
 
-  // ── Scroll → currentTime (guide §3) ────────────────────────────────────────
+  // ── Frame rendering via requestVideoFrameCallback (rVFC) ────────────────────
+  // rVFC fires exactly when a newly decoded frame is ready — no stale draws,
+  // no blank frames between keyframes. Falls back to RAF for older browsers.
+  useEffect(() => {
+    const video  = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
+
+    // alpha:false = no per-pixel alpha compositing → faster GPU blit
+    // desynchronized:true = canvas updates decouple from page frame budget → lower latency
+    const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true })!;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "medium";
+
+    let rVFCHandle: number | null = null;
+    let rafHandle:  number | null = null;
+    let active = true;
+
+    const draw = () => {
+      if (!active || video.readyState < 2) return;
+      const cw = canvas.width, ch = canvas.height;
+      ctx.fillStyle = "#040408";
+      ctx.fillRect(0, 0, cw, ch);
+      drawCover(ctx, video, cw, ch);
+    };
+
+    const hasRVFC = "requestVideoFrameCallback" in video;
+
+    if (hasRVFC) {
+      // rVFC path: draw only when the browser signals a new decoded frame
+      const onFrame = () => {
+        draw();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        rVFCHandle = (video as any).requestVideoFrameCallback(onFrame);
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      rVFCHandle = (video as any).requestVideoFrameCallback(onFrame);
+    } else {
+      // RAF fallback for browsers without rVFC (Safari < 15.4, Firefox < 132)
+      const loop = () => {
+        if (!active) return;
+        draw();
+        rafHandle = requestAnimationFrame(loop);
+      };
+      rafHandle = requestAnimationFrame(loop);
+    }
+
+    const onReady = () => setVideoReady(true);
+    video.addEventListener("canplaythrough", onReady);
+    if (video.readyState >= 4) onReady();
+
+    return () => {
+      active = false;
+      video.removeEventListener("canplaythrough", onReady);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (rVFCHandle !== null) (video as any).cancelVideoFrameCallback(rVFCHandle);
+      if (rafHandle  !== null) cancelAnimationFrame(rafHandle);
+    };
+  }, []);
+
+  // ── Scroll → currentTime + section detection ─────────────────────────────────
   useEffect(() => {
     const video      = videoRef.current;
     const scrollHint = scrollHintRef.current;
 
     const update = () => {
-      // Read scrollY once per frame (guide §6 — avoid layout thrashing)
       const scrollH = document.body.scrollHeight - window.innerHeight;
       const f = scrollH > 0 ? Math.min(Math.max(window.scrollY / scrollH, 0), 1) : 0;
 
-      // Direct currentTime mapping — no lerp (guide §3)
+      // Direct seek — no lerp
       if (video && video.duration) {
         video.currentTime = f * video.duration;
       }
 
-      // Scroll hint — DOM write bypasses React re-render (guide §6)
+      // Scroll hint fade via direct DOM write — no React re-render
       if (scrollHint) {
         scrollHint.style.opacity = f < 0.05 ? String(1 - f / 0.05) : "0";
       }
 
-      // Section detection: three equal thirds
+      // Section: three equal thirds
       const next = f < 0.334 ? 0 : f < 0.667 ? 1 : 2;
       if (next !== prevSecRef.current) {
         prevSecRef.current = next;
@@ -68,47 +140,51 @@ export default function VideoScroll() {
       ticking.current = false;
     };
 
-    // Wrap scroll in RAF debounce (guide §6)
+    // RAF debounce — one update per frame, no matter how many scroll events fire
     const onScroll = () => {
       if (ticking.current) return;
       ticking.current = true;
-      rafRef.current = requestAnimationFrame(update);
+      requestAnimationFrame(update);
     };
 
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => {
       window.removeEventListener("scroll", onScroll);
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      if (timerRef.current)  clearTimeout(timerRef.current);
+      if (timerRef.current) clearTimeout(timerRef.current);
     };
   }, []);
 
   return (
     <>
-      {/* ── Scroll space: 500vh per guide §1 ─────────────────────────────── */}
+      {/* Scroll space: 500vh */}
       <div style={{ height: "500vh" }} />
 
-      {/* ── Video: position fixed, object-fit cover — no canvas (guide §2) ── */}
+      {/* Hidden video — decode engine only, never painted directly */}
       <video
         ref={videoRef}
         muted
         playsInline
         preload="auto"
+        style={{ display: "none" }}
+      >
+        <source src="/scroll-video.mp4" type="video/mp4" />
+      </video>
+
+      {/* Canvas — receives decoded frames via rVFC, GPU-composited */}
+      <canvas
+        ref={canvasRef}
         style={{
           position: "fixed",
           top: 0, left: 0,
           width: "100vw", height: "100vh",
-          objectFit: "cover",
           zIndex: 0,
           backgroundColor: "#040408",
           opacity: videoReady ? 1 : 0,
           transition: "opacity 0.7s ease",
         }}
-      >
-        <source src="/scroll-video.mp4" type="video/mp4" />
-      </video>
+      />
 
-      {/* ── Vignette (guide §4 — sits above video, below text) ───────────── */}
+      {/* Vignette */}
       <div
         aria-hidden
         style={{
@@ -122,7 +198,7 @@ export default function VideoScroll() {
         }}
       />
 
-      {/* ── Section text: position fixed, will-change (guide §4 + §6) ──────── */}
+      {/* Section text */}
       {videoReady && (
         <div
           style={{
@@ -163,7 +239,7 @@ export default function VideoScroll() {
         </div>
       )}
 
-      {/* ── Section progress dots ──────────────────────────────────────────── */}
+      {/* Section progress dots */}
       {videoReady && (
         <div
           style={{
@@ -228,7 +304,7 @@ export default function VideoScroll() {
         </div>
       )}
 
-      {/* ── Scroll hint: only mounted on section 0 — prevents CTA overlap ───── */}
+      {/* Scroll hint — only on section 0, opacity via DOM ref */}
       {videoReady && sectionIdx === 0 && (
         <div
           ref={scrollHintRef}
@@ -284,7 +360,7 @@ export default function VideoScroll() {
         </div>
       )}
 
-      {/* ── Loading screen: hidden on canplaythrough (guide §6) ───────────── */}
+      {/* Loading screen */}
       {!videoReady && (
         <div
           style={{
@@ -298,14 +374,7 @@ export default function VideoScroll() {
             justifyContent: "center",
           }}
         >
-          <div
-            style={{
-              width: 260,
-              display: "flex",
-              flexDirection: "column",
-              gap: 20,
-            }}
-          >
+          <div style={{ width: 260, display: "flex", flexDirection: "column", gap: 20 }}>
             <div
               style={{
                 fontSize: 12,
