@@ -54,60 +54,86 @@ export default function VideoScroll() {
   }, []);
 
   // ── Frame extraction ───────────────────────────────────────────────────────
-  // Seek forward through the video sequentially (fastest decode path for H.264),
-  // capture each position as an ImageBitmap (GPU-resident, instant drawImage).
-  // After this, scrubbing never touches the video decoder again.
   useEffect(() => {
     let cancelled = false;
 
     const extract = async () => {
       const video = document.createElement("video");
-      video.muted      = true;
+      video.muted       = true;
       video.playsInline = true;
-      video.preload    = "auto";
-      video.src        = "/scroll-video.mp4";
+      video.preload     = "auto";
+      video.src         = "/scroll-video.mp4";
+      video.load(); // explicitly trigger network request
 
-      // Wait for metadata so duration is available
-      await new Promise<void>(res => {
-        if (video.readyState >= 1) { res(); return; }
-        video.addEventListener("loadedmetadata", () => res(), { once: true });
-      });
+      try {
+        // Wait until the browser has enough data to play (canplay is more
+        // reliable than loadedmetadata on deployed/CDN-served videos)
+        await new Promise<void>((res, rej) => {
+          if (video.readyState >= 3) { res(); return; }
+          const cleanup = () => {
+            clearTimeout(t);
+            video.removeEventListener("canplay", ok);
+            video.removeEventListener("error",   fail);
+          };
+          const ok   = () => { cleanup(); res(); };
+          const fail = () => { cleanup(); rej(new Error("video failed to load")); };
+          const t    = setTimeout(() => { cleanup(); rej(new Error("video load timeout")); }, 25000);
+          video.addEventListener("canplay", ok,   { once: true });
+          video.addEventListener("error",   fail, { once: true });
+        });
 
-      const duration = video.duration;
-      const bitmaps: ImageBitmap[] = [];
-
-      for (let i = 0; i < FRAME_COUNT; i++) {
         if (cancelled) return;
 
-        // Always seek forward — fastest decode pattern for H.264
-        video.currentTime = (i / (FRAME_COUNT - 1)) * duration;
+        const duration = video.duration;
+        const vw = video.videoWidth  || 960;
+        const vh = video.videoHeight || 540;
 
-        await new Promise<void>(res =>
-          video.addEventListener("seeked", () => res(), { once: true }),
-        );
+        // Intermediate canvas: more cross-browser than createImageBitmap(video) directly
+        const scratch = document.createElement("canvas");
+        scratch.width  = vw;
+        scratch.height = vh;
+        const sctx = scratch.getContext("2d")!;
 
-        // createImageBitmap copies the decoded frame into GPU memory
-        const bmp = await createImageBitmap(video);
-        bitmaps.push(bmp);
+        const bitmaps: ImageBitmap[] = [];
 
-        setLoadedCount(i + 1);
+        for (let i = 0; i < FRAME_COUNT; i++) {
+          if (cancelled) return;
 
-        // Draw first frame to canvas immediately so there's no blank flash
-        if (i === 0) {
-          const c = canvasRef.current;
-          if (c) {
-            const ctx = c.getContext("2d", { alpha: false })!;
-            ctx.fillStyle = "#040408";
-            ctx.fillRect(0, 0, c.width, c.height);
-            drawCover(ctx, bmp, c.width, c.height);
+          video.currentTime = (i / (FRAME_COUNT - 1)) * duration;
+
+          // seeked with 3 s timeout — some browsers are slow on first few seeks
+          await new Promise<void>(res => {
+            const t = setTimeout(() => res(), 3000);
+            video.addEventListener("seeked", () => { clearTimeout(t); res(); }, { once: true });
+          });
+
+          if (cancelled) return;
+
+          sctx.drawImage(video, 0, 0, vw, vh);
+          const bmp = await createImageBitmap(scratch);
+          bitmaps.push(bmp);
+          setLoadedCount(i + 1);
+
+          // Show first frame immediately — no blank flash on reveal
+          if (i === 0) {
+            const c = canvasRef.current;
+            if (c) {
+              const ctx = c.getContext("2d", { alpha: false })!;
+              ctx.fillStyle = "#040408";
+              ctx.fillRect(0, 0, c.width, c.height);
+              drawCover(ctx, bmp, c.width, c.height);
+            }
           }
         }
-      }
 
-      if (cancelled) return;
-      framesRef.current = bitmaps;
-      video.src = ""; // release video resources
-      setFramesReady(true);
+        if (cancelled) return;
+        framesRef.current = bitmaps;
+        video.src = "";
+        setFramesReady(true);
+
+      } catch (err) {
+        console.error("[VideoScroll] frame extraction failed:", err);
+      }
     };
 
     extract();
